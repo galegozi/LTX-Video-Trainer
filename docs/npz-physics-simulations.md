@@ -8,23 +8,85 @@ The LTX-Video trainer now supports NPZ files containing physics simulation data.
 - Train models on scientific simulation data
 - Use image-to-video mode where the first frame conditions the generation
 - Predict entire simulation sequences from initial states
+- Handle multiple channel data (temperature, pressure, velocity, etc.)
 
-## 📁 NPZ File Format
+## 📁 NPZ File Formats
 
-Your NPZ files must follow this structure:
+The trainer supports **three different NPZ formats** to accommodate various simulation outputs:
+
+### Format 1: Single NPZ with All Frames
+
+A single NPZ file containing all frames in a single array:
 
 ```python
 import numpy as np
 
-# Create example NPZ file
+# Create example NPZ file with all frames
 frames = np.random.rand(121, 512, 512, 3)  # (T, H, W, C) format
-fps = 24  # Optional, defaults to 24 if not provided
+fps = 24
 
 np.savez('simulation_001.npz', frames=frames, fps=fps)
 ```
 
+### Format 2: Single NPZ with Multiple Channels (Per-Frame)
+
+A single NPZ file representing one frame with multiple simulation channels:
+
+```python
+import numpy as np
+
+# Create example NPZ file with multiple channels
+temperature = np.random.rand(512, 512)  # (H, W)
+pressure = np.random.rand(512, 512)     # (H, W)
+velocity_x = np.random.rand(512, 512)   # (H, W)
+
+# Save with channel specification
+np.savez(
+    'frame_0000.npz',
+    temperature=temperature,
+    pressure=pressure,
+    velocity_x=velocity_x,
+    channels=['temperature', 'pressure', 'velocity_x'],  # Specify which channels and order
+    fps=24
+)
+```
+
+### Format 3: Directory of NPZ Files (NPZ Sequence)
+
+**NEW!** Multiple NPZ files, one per frame, each containing multiple channels:
+
+```python
+import numpy as np
+from pathlib import Path
+
+# Create a directory for the sequence
+sequence_dir = Path('simulation_001')
+sequence_dir.mkdir(exist_ok=True)
+
+# Create multiple frames, each with multiple channels
+for frame_idx in range(121):
+    temperature = np.random.rand(512, 512)
+    pressure = np.random.rand(512, 512)
+    velocity_x = np.random.rand(512, 512)
+    velocity_y = np.random.rand(512, 512)
+    
+    # Save each frame as a separate NPZ file
+    np.savez(
+        sequence_dir / f'frame_{frame_idx:04d}.npz',
+        temperature=temperature,
+        pressure=pressure,
+        velocity_x=velocity_x,
+        velocity_y=velocity_y,
+        channels=['temperature', 'pressure', 'velocity_x'],  # First 3 channels for RGB
+        fps=24  # Only needed in first frame
+    )
+```
+
+**Note:** The NPZ files will be loaded in alphabetical/numerical order, so use consistent naming like `frame_0000.npz`, `frame_0001.npz`, etc.
+
 ### Required Keys
 
+**For Format 1 (single NPZ with all frames):**
 - **`frames`** or **`data`**: Numpy array containing the simulation frames
   - Supported shapes:
     - `(T, H, W, C)` - Time, Height, Width, Channels (will be converted to `(T, C, H, W)`)
@@ -33,17 +95,43 @@ np.savez('simulation_001.npz', frames=frames, fps=fps)
   - Channels: 1 (grayscale, will be expanded), 3 (RGB), or 4 (RGBA, alpha will be dropped)
   - Value range: `[0, 1]` (normalized) or `[0, 255]` (will be automatically normalized)
 
+**For Format 2 & 3 (per-frame with multiple channels):**
+- **Channel keys**: Multiple keys, each representing a simulation channel (e.g., `temperature`, `pressure`, `velocity_x`)
+  - Each channel should be a 2D array with shape `(H, W)`
+  - Can have any number of channels (first 3 will be used for RGB visualization)
+  - Values will be automatically normalized to `[0, 1]` range
+  
+- **`channels`** (optional but recommended): List or array specifying which channels to use and in what order
+  - Example: `['temperature', 'pressure', 'velocity_x']`
+  - If not provided, the first 3 available channels will be used
+  - For Format 3, this should be in the first NPZ file
+
 ### Optional Keys
 
 - **`fps`**: Frames per second (float). Defaults to 24 if not provided.
+  - For Format 3 (NPZ sequence), only needs to be in the first file
+
+### Channel Selection and Mapping
+
+When your NPZ files contain multiple channels (Format 2 & 3):
+- The trainer maps the first 3 channels to RGB for visualization
+- You can specify which channels to use via the `channels` key
+- If you have more than 3 channels, only the first 3 will be used
+- Example mapping: `['temperature', 'pressure', 'velocity_magnitude']` → R, G, B
+
+**Tips for Channel Selection:**
+- Choose channels with complementary information
+- Consider normalizing channels to similar ranges
+- Channels with high contrast work best for visualization
+- You can create derived channels (e.g., velocity magnitude from velocity_x and velocity_y)
 
 ## 🎬 Dataset Preparation
 
 ### Step 1: Prepare Your Dataset Metadata
 
-Create a JSON, JSONL, or CSV file that references your NPZ files:
+Create a JSON, JSONL, or CSV file that references your NPZ files or NPZ directories:
 
-**JSON format:**
+**Format 1 - Single NPZ files (JSON):**
 ```json
 [
   {
@@ -57,17 +145,33 @@ Create a JSON, JSONL, or CSV file that references your NPZ files:
 ]
 ```
 
+**Format 3 - NPZ Sequences (JSON):**
+```json
+[
+  {
+    "caption": "Fluid dynamics simulation with high viscosity",
+    "media_path": "simulations/fluid_001"
+  },
+  {
+    "caption": "Particle collision at high energy",  
+    "media_path": "simulations/particle_002"
+  }
+]
+```
+
+Where each path points to a directory containing `frame_0000.npz`, `frame_0001.npz`, etc.
+
 **JSONL format:**
 ```jsonl
-{"caption": "Fluid dynamics simulation with high viscosity", "media_path": "simulations/fluid_001.npz"}
-{"caption": "Particle collision at high energy", "media_path": "simulations/particle_002.npz"}
+{"caption": "Fluid dynamics simulation with high viscosity", "media_path": "simulations/fluid_001"}
+{"caption": "Particle collision at high energy", "media_path": "simulations/particle_002"}
 ```
 
 **CSV format:**
 ```csv
 caption,media_path
-"Fluid dynamics simulation with high viscosity","simulations/fluid_001.npz"
-"Particle collision at high energy","simulations/particle_002.npz"
+"Fluid dynamics simulation with high viscosity","simulations/fluid_001"
+"Particle collision at high energy","simulations/particle_002"
 ```
 
 ### Step 2: Preprocess Your NPZ Dataset
@@ -184,14 +288,136 @@ def extract_first_frame(npz_path, output_path):
     
     img.save(output_path)
 
-# Example usage
+# Example usage for single NPZ
 extract_first_frame('simulations/fluid_001.npz', 'first_frames/fluid_001.png')
+
+# Example usage for NPZ sequence
+extract_first_frame('simulations/fluid_001/frame_0000.npz', 'first_frames/fluid_001.png')
 ```
 
 ### Step 5: Train Your Model
 
 ```bash
 python scripts/train.py configs/physics_simulation_config.yaml
+```
+
+## 💡 Complete Example: Working with Per-Frame NPZ Files
+
+Here's a complete example for the common case where you have one NPZ file per frame with multiple channels:
+
+### Creating NPZ Sequence from Simulation Data
+
+```python
+import numpy as np
+from pathlib import Path
+
+def create_npz_sequence_from_simulation(
+    simulation_data,  # Your simulation output
+    output_dir,
+    channel_names=['temperature', 'pressure', 'velocity_magnitude'],
+    fps=24
+):
+    """Convert simulation data to NPZ sequence format.
+    
+    Args:
+        simulation_data: dict with keys as channel names, values as arrays (T, H, W)
+        output_dir: Directory to save NPZ files
+        channel_names: List of channels to include (in RGB order)
+        fps: Frames per second
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    num_frames = next(iter(simulation_data.values())).shape[0]
+    
+    for frame_idx in range(num_frames):
+        frame_data = {}
+        
+        # Extract each channel for this frame
+        for channel_name in channel_names:
+            if channel_name in simulation_data:
+                frame_data[channel_name] = simulation_data[channel_name][frame_idx]
+        
+        # Add metadata (only in first frame, but won't hurt to add to all)
+        frame_data['channels'] = channel_names
+        frame_data['fps'] = fps
+        
+        # Save frame
+        output_path = output_dir / f'frame_{frame_idx:04d}.npz'
+        np.savez(output_path, **frame_data)
+    
+    print(f"Created {num_frames} NPZ files in {output_dir}")
+
+# Example usage:
+# Assume you have simulation output with shape (T, H, W) for each field
+simulation_output = {
+    'temperature': np.random.rand(121, 512, 512),
+    'pressure': np.random.rand(121, 512, 512),
+    'velocity_x': np.random.rand(121, 512, 512),
+    'velocity_y': np.random.rand(121, 512, 512),
+}
+
+# Compute velocity magnitude for better visualization
+velocity_mag = np.sqrt(
+    simulation_output['velocity_x']**2 + 
+    simulation_output['velocity_y']**2
+)
+simulation_output['velocity_magnitude'] = velocity_mag
+
+# Create NPZ sequence
+create_npz_sequence_from_simulation(
+    simulation_output,
+    output_dir='simulations/fluid_001',
+    channel_names=['temperature', 'pressure', 'velocity_magnitude'],
+    fps=24
+)
+```
+
+### Preparing Dataset Metadata
+
+```python
+import json
+from pathlib import Path
+
+def create_dataset_metadata(simulation_dirs, captions, output_file):
+    """Create dataset JSON for NPZ sequences.
+    
+    Args:
+        simulation_dirs: List of paths to directories containing NPZ sequences
+        captions: List of captions for each simulation
+        output_file: Output JSON file path
+    """
+    dataset = []
+    
+    for sim_dir, caption in zip(simulation_dirs, captions):
+        # Verify the directory has NPZ files
+        npz_files = list(Path(sim_dir).glob('*.npz'))
+        if npz_files:
+            dataset.append({
+                'caption': caption,
+                'media_path': str(sim_dir)
+            })
+            print(f"Added {sim_dir} with {len(npz_files)} frames")
+    
+    with open(output_file, 'w') as f:
+        json.dump(dataset, f, indent=2)
+    
+    print(f"Created dataset metadata with {len(dataset)} simulations")
+
+# Example usage:
+create_dataset_metadata(
+    simulation_dirs=[
+        'simulations/fluid_001',
+        'simulations/fluid_002',
+        'simulations/particle_001',
+    ],
+    captions=[
+        'High viscosity fluid dynamics with turbulent flow',
+        'Low viscosity fluid dynamics with laminar flow',
+        'Particle collision simulation at high energy',
+    ],
+    output_file='physics_dataset.json'
+)
 ```
 
 ## 🎯 Training Modes
