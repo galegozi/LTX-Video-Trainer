@@ -72,6 +72,8 @@ class MediaDataset(Dataset):
         video_column: str,
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
+        initial_frame_index: int = 0,
+        preserve_all_channels: bool = False,
     ) -> None:
         """
         Initialize the media dataset.
@@ -81,6 +83,8 @@ class MediaDataset(Dataset):
             video_column: Column name for video paths in the metadata file
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
+            initial_frame_index: Which frame to use as initial condition for sequences
+            preserve_all_channels: If True, save all channel metadata for NPZ files
         """
         super().__init__()
 
@@ -88,6 +92,8 @@ class MediaDataset(Dataset):
         self.main_media_column = main_media_column
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
+        self.initial_frame_index = initial_frame_index
+        self.preserve_all_channels = preserve_all_channels
 
         # First load main media paths
         self.main_media_paths = self._load_video_paths(main_media_column)
@@ -124,24 +130,39 @@ class MediaDataset(Dataset):
         relative_path = str(video_path.relative_to(data_root))
         media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
 
+        # Initialize channel metadata
+        channel_metadata = None
+
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             video = self._preprocess_image(video_path)
             fps = 1
-        elif video_path.suffix.lower() == ".npz":
+        elif video_path.suffix.lower() == ".npz" or (video_path.is_dir() and list(video_path.glob("*.npz"))):
             # Check if this is a single NPZ file or a directory of NPZ files
             # If the path points to a directory, treat it as a sequence
             if video_path.is_dir():
-                video, fps = self._preprocess_npz_sequence(video_path)
+                video, fps, channel_metadata = self._preprocess_npz_sequence(video_path)
             else:
-                video, fps = self._preprocess_npz(video_path)
+                video, fps, channel_metadata = self._preprocess_npz(video_path)
         else:
             video, fps = self._preprocess_video(video_path)
 
-        return {
+        result = {
             "video": video,
             "relative_path": relative_path,
             "main_media_relative_path": media_relative_path,
             "video_metadata": {
+                "num_frames": video.shape[0],
+                "height": video.shape[2],
+                "width": video.shape[3],
+                "fps": fps,
+            },
+        }
+        
+        # Add channel metadata if available and preservation is enabled
+        if channel_metadata is not None and self.preserve_all_channels:
+            result["channel_metadata"] = channel_metadata
+        
+        return result
                 "num_frames": video.shape[0],
                 "height": video.shape[2],
                 "width": video.shape[3],
@@ -333,7 +354,7 @@ class MediaDataset(Dataset):
 
         return frames, fps
 
-    def _preprocess_npz(self, path: Path) -> tuple[torch.Tensor, float]:
+    def _preprocess_npz(self, path: Path) -> tuple[torch.Tensor, float, dict | None]:
         """Preprocess an NPZ file containing physics simulation frames.
         
         Supports two formats:
@@ -354,13 +375,17 @@ class MediaDataset(Dataset):
             path: Path to the NPZ file
             
         Returns:
-            Tuple of (frames tensor, fps)
+            Tuple of (frames tensor, fps, channel_metadata)
         """
         # Load NPZ file
         data = np.load(path)
         
         # Get FPS if available, otherwise default to 24
         fps = float(data.get('fps', 24))
+        
+        # Initialize channel metadata
+        channel_metadata = None
+        channel_names_used = None
         
         # Check if this is Format 1 (frames key) or Format 2 (multiple channels)
         if 'frames' in data or 'data' in data:
@@ -402,6 +427,9 @@ class MediaDataset(Dataset):
                     f"Available keys: {list(data.keys())}"
                 )
             
+            # Store channel names for metadata
+            channel_names_used = channel_names
+            
             # Load and stack channels
             channel_data = []
             for channel_name in channel_names:
@@ -425,6 +453,14 @@ class MediaDataset(Dataset):
             frames = torch.stack(channel_data, dim=0)
             # Add time dimension: (1, C, H, W)
             frames = frames.unsqueeze(0)
+            
+            # Create channel metadata
+            if self.preserve_all_channels:
+                channel_metadata = {
+                    'channel_names': channel_names_used,
+                    'all_available_channels': available_keys,
+                    'source_path': str(path),
+                }
         
         # Normalize to [0, 1] if values are in [0, 255] or larger
         if frames.max() > 1.0:
@@ -481,9 +517,9 @@ class MediaDataset(Dataset):
         # Apply transforms
         frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
         
-        return frames, fps
+        return frames, fps, channel_metadata
 
-    def _preprocess_npz_sequence(self, path: Path) -> tuple[torch.Tensor, float]:
+    def _preprocess_npz_sequence(self, path: Path) -> tuple[torch.Tensor, float, dict | None]:
         """Preprocess a sequence of NPZ files (one per frame).
         
         Each NPZ file should contain:
@@ -496,7 +532,7 @@ class MediaDataset(Dataset):
             path: Path to directory containing NPZ files
             
         Returns:
-            Tuple of (frames tensor, fps)
+            Tuple of (frames tensor, fps, channel_metadata)
         """
         # Get all NPZ files in directory, sorted by name
         npz_files = sorted(path.glob("*.npz"))
@@ -504,15 +540,25 @@ class MediaDataset(Dataset):
         if not npz_files:
             raise ValueError(f"No NPZ files found in directory: {path}")
         
-        # Load first file to get FPS and channel configuration
-        first_data = np.load(npz_files[0])
-        fps = float(first_data.get('fps', 24))
+        # Validate initial frame index
+        if self.initial_frame_index >= len(npz_files):
+            logger.warning(
+                f"Initial frame index {self.initial_frame_index} >= number of files {len(npz_files)}. "
+                f"Using index 0 instead."
+            )
+            start_frame_idx = 0
+        else:
+            start_frame_idx = self.initial_frame_index
+        
+        # Load initial frame file to get FPS and channel configuration
+        initial_frame_data = np.load(npz_files[start_frame_idx])
+        fps = float(initial_frame_data.get('fps', 24))
         
         # Get channel names
-        available_keys = [k for k in first_data.keys() if k not in ['fps', 'channels']]
+        available_keys = [k for k in initial_frame_data.keys() if k not in ['fps', 'channels']]
         
-        if 'channels' in first_data:
-            channel_names = first_data['channels']
+        if 'channels' in initial_frame_data:
+            channel_names = initial_frame_data['channels']
             if isinstance(channel_names, np.ndarray):
                 channel_names = channel_names.tolist()
                 if isinstance(channel_names[0], bytes):
@@ -524,33 +570,52 @@ class MediaDataset(Dataset):
         if not channel_names:
             raise ValueError(
                 f"No valid channel data found in NPZ files. "
-                f"Available keys in first file: {list(first_data.keys())}"
+                f"Available keys in initial frame: {list(initial_frame_data.keys())}"
             )
         
-        logger.info(f"Loading NPZ sequence from {path.name} with {len(npz_files)} frames using channels: {channel_names}")
+        # Create channel metadata
+        channel_metadata = None
+        if self.preserve_all_channels:
+            channel_metadata = {
+                'channel_names': channel_names,
+                'all_available_channels': available_keys,
+                'initial_frame_index': start_frame_idx,
+                'num_files': len(npz_files),
+                'source_path': str(path),
+            }
+        
+        logger.info(
+            f"Loading NPZ sequence from {path.name}: "
+            f"{len(npz_files)} files, starting from frame {start_frame_idx}, "
+            f"using channels: {channel_names}"
+        )
         
         # Determine how many frames to load based on resolution buckets
         max_frames_needed = max(bucket[0] for bucket in self.resolution_buckets)
-        frames_to_load = min(len(npz_files), max_frames_needed)
+        frames_available = len(npz_files) - start_frame_idx
+        frames_to_load = min(frames_available, max_frames_needed)
         
-        # Load frames
+        # Load frames starting from initial frame
         all_frames = []
-        for npz_file in npz_files[:frames_to_load]:
-            frame_data = np.load(npz_file)
+        for i in range(start_frame_idx, start_frame_idx + frames_to_load):
+            if i >= len(npz_files):
+                break
+            
+            frame_data = np.load(npz_files[i])
             
             # Load and stack channels for this frame
             channel_data = []
             for channel_name in channel_names:
                 if channel_name not in frame_data:
                     raise ValueError(
-                        f"Channel '{channel_name}' not found in {npz_file.name}. "
+                        f"Channel '{channel_name}' not found in {npz_files[i].name}. "
                         f"Available keys: {list(frame_data.keys())}"
                     )
                 channel = frame_data[channel_name]
                 
                 if channel.ndim != 2:
                     raise ValueError(
-                        f"Expected channel '{channel_name}' in {npz_file.name} to be 2D (H, W), "
+                        f"Expected channel '{channel_name}' in {npz_files[i].name} to be 2D (H, W), "
                         f"got shape {channel.shape}"
                     )
                 
@@ -611,7 +676,7 @@ class MediaDataset(Dataset):
         # Apply transforms
         frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
         
-        return frames, fps
+        return frames, fps, channel_metadata
 
     def _find_nearest_resolution(self, height: int, width: int) -> tuple[int, int]:
         """Find the nearest resolution bucket for the given dimensions."""
