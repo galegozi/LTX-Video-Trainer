@@ -188,6 +188,39 @@ class DataConfig(ConfigBaseModel):
         description="Number of background processes for data loading (0 means synchronous loading)",
         ge=0,
     )
+    
+    npz_initial_frame_index: int = Field(
+        default=0,
+        description="Frame index to use as initial condition for NPZ sequences (default: 0 = first frame)",
+        ge=0,
+    )
+    
+    npz_channel_names: list[str] | None = Field(
+        default=None,
+        description="List of channel names to use from NPZ files. If None, uses first 3 channels for RGB",
+    )
+    
+    npz_preserve_all_channels: bool = Field(
+        default=False,
+        description="If True, preserve all channel data for post-processing (stored as metadata)",
+    )
+    
+    # NEW: Multi-channel support
+    use_multi_channel_vae: bool = Field(
+        default=False,
+        description="Enable multi-channel VAE wrapper to process all channels (not just RGB)",
+    )
+    
+    num_channels: int = Field(
+        default=3,
+        description="Total number of channels to process (3 for RGB, >3 for multi-channel)",
+        ge=1,
+    )
+    
+    channel_grouping_strategy: str = Field(
+        default="sequential",
+        description="Strategy for grouping channels in multi-channel mode ('sequential' or 'interleaved')",
+    )
 
 
 class ValidationConfig(ConfigBaseModel):
@@ -252,6 +285,22 @@ class ValidationConfig(ConfigBaseModel):
     skip_initial_validation: bool = Field(
         default=False,
         description="Skip validation video sampling at step 0 (beginning of training)",
+    )
+    
+    output_fps: float = Field(
+        default=20.0,
+        description="Frames per second for output videos (not simulation time)",
+        gt=0.0,
+    )
+    
+    visualization_script: str | None = Field(
+        default=None,
+        description="Path to custom visualization script for generating validation outputs",
+    )
+    
+    save_comparison_gif: bool = Field(
+        default=False,
+        description="Save comparison GIF showing true/predicted/difference for NPZ sequences",
     )
 
     @field_validator("images")

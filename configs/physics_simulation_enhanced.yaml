@@ -1,0 +1,113 @@
+# LTX-Video Training Configuration for NPZ Physics Simulations
+# Enhanced version with support for initial frame selection, channel metadata, and custom visualization
+
+# Model configuration
+model:
+  model_source: "LTXV_13B_097_DEV" # Options: "LTXV_13B_097_DEV", "LTXV_2B_0.9.6_DEV", etc.
+  training_mode: "lora" # Options: "lora" or "full"
+  load_checkpoint: null # Path to checkpoint file or directory to resume from
+
+# LoRA configuration
+lora:
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+# Conditioning configuration for image-to-video mode
+conditioning:
+  mode: "none"
+  # Set to 1.0 for always conditioning on first frame (recommended for physics simulations)
+  # This makes the model predict the entire sequence based on the initial state
+  first_frame_conditioning_p: 1.0
+
+# Optimization configuration
+optimization:
+  learning_rate: 2e-4
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw" # Options: "adamw" or "adamw8bit"
+  scheduler_type: "linear" # Options: "constant", "linear", "cosine", "cosine_with_restarts", "polynomial"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+# Acceleration optimization
+acceleration:
+  mixed_precision_mode: "bf16" # Options: "no", "fp16", "bf16"
+  quantization: null # Options: null, "int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"
+  load_text_encoder_in_8bit: false # Load text encoder in 8-bit precision to save memory
+  compile_with_inductor: false
+  compilation_mode: "reduce-overhead" # Options: "default", "reduce-overhead", "max-autotune"
+
+# Data configuration - ENHANCED for NPZ simulations
+data:
+  preprocessed_data_root: "/path/to/preprocessed/data"
+  num_dataloader_workers: 2
+  
+  # NPZ-specific settings
+  npz_initial_frame_index: 0  # Which frame to use as initial condition (0 = first frame)
+  npz_channel_names: null  # List of channel names to use, e.g., ["temperature", "pressure", "velocity_x"]
+                           # If null, uses first 3 channels or those specified in NPZ files
+  npz_preserve_all_channels: true  # Preserve all channel metadata for visualization
+
+# Validation configuration - ENHANCED for NPZ visualization
+validation:
+  prompts:
+    - "Fluid dynamics simulation with turbulent flow"
+    - "Wave propagation in 2D medium"
+    - "Particle system with collision dynamics"
+  
+  # IMPORTANT: For image-to-video validation, provide first frames extracted from NPZ files
+  # Extract using: python scripts/npz_utils.py extract-frames <input_dir> <output_dir>
+  images:
+    - "/path/to/first_frames/fluid_001.png"
+    - "/path/to/first_frames/wave_001.png"
+    - "/path/to/first_frames/particle_001.png"
+  
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  video_dims: [512, 512, 101] # [width, height, frames] - set to your simulation dimensions
+  seed: 42
+  inference_steps: 50
+  interval: 250 # Set to null to disable validation
+  videos_per_prompt: 1
+  guidance_scale: 3.5
+  
+  # NEW: NPZ visualization settings
+  output_fps: 20.0  # Output frame rate (not simulation time)
+  visualization_script: null  # Path to custom visualization script (optional)
+  save_comparison_gif: true  # Save comparison GIF (true/predicted/difference)
+
+# Checkpoint configuration
+checkpoints:
+  interval: 250 # Save a checkpoint every N steps, set to null to disable
+  keep_last_n: 3 # Keep only the N most recent checkpoints, set to -1 to keep all
+
+# Flow matching configuration
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal" # Options: "uniform", "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# HuggingFace Hub configuration
+hub:
+  push_to_hub: false # Whether to push the model weights to the Hugging Face Hub
+  hub_model_id: null # Hugging Face Hub repository ID (e.g., 'username/repo-name')
+
+# W&B configuration
+wandb:
+  enabled: false  # Set to true to enable W&B logging
+  project: "ltxv-physics-simulations"
+  entity: null  # Your W&B username or team
+  tags: ["physics", "npz", "image-to-video", "multi-channel"]
+  log_validation_videos: true
+
+# General configuration
+seed: 42
+output_dir: "outputs/physics_simulation_enhanced"

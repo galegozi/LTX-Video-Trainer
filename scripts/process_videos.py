@@ -72,6 +72,10 @@ class MediaDataset(Dataset):
         video_column: str,
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
+        initial_frame_index: int = 0,
+        preserve_all_channels: bool = False,
+        use_multi_channel: bool = False,
+        num_channels: int = 3,
     ) -> None:
         """
         Initialize the media dataset.
@@ -81,6 +85,10 @@ class MediaDataset(Dataset):
             video_column: Column name for video paths in the metadata file
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
+            initial_frame_index: Which frame to use as initial condition for sequences
+            preserve_all_channels: If True, save all channel metadata for NPZ files
+            use_multi_channel: If True, preserve all channels for multi-channel VAE
+            num_channels: Number of channels to preserve (only used if use_multi_channel=True)
         """
         super().__init__()
 
@@ -88,6 +96,10 @@ class MediaDataset(Dataset):
         self.main_media_column = main_media_column
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
+        self.initial_frame_index = initial_frame_index
+        self.preserve_all_channels = preserve_all_channels
+        self.use_multi_channel = use_multi_channel
+        self.num_channels = num_channels
 
         # First load main media paths
         self.main_media_paths = self._load_video_paths(main_media_column)
@@ -100,13 +112,21 @@ class MediaDataset(Dataset):
 
         self.max_num_frames = max(self.resolution_buckets, key=lambda x: x[0])[0]
 
-        # Set up video transforms
-        self.transforms = transforms.Compose(
-            [
+        # Set up video transforms - need to handle different channel counts
+        if use_multi_channel and num_channels != 3:
+            # For multi-channel, don't normalize - will handle per-channel later
+            self.transforms = transforms.Compose([
                 transforms.Lambda(lambda x: x.clamp_(0, 1)),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
-            ]
-        )
+                # Note: Normalization will be handled separately for multi-channel
+            ])
+        else:
+            # Standard 3-channel normalization
+            self.transforms = transforms.Compose(
+                [
+                    transforms.Lambda(lambda x: x.clamp_(0, 1)),
+                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+                ]
+            )
 
     def __len__(self) -> int:
         return len(self.video_paths)
@@ -124,13 +144,23 @@ class MediaDataset(Dataset):
         relative_path = str(video_path.relative_to(data_root))
         media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
 
+        # Initialize channel metadata
+        channel_metadata = None
+
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             video = self._preprocess_image(video_path)
             fps = 1
+        elif video_path.suffix.lower() == ".npz" or (video_path.is_dir() and list(video_path.glob("*.npz"))):
+            # Check if this is a single NPZ file or a directory of NPZ files
+            # If the path points to a directory, treat it as a sequence
+            if video_path.is_dir():
+                video, fps, channel_metadata = self._preprocess_npz_sequence(video_path)
+            else:
+                video, fps, channel_metadata = self._preprocess_npz(video_path)
         else:
             video, fps = self._preprocess_video(video_path)
 
-        return {
+        result = {
             "video": video,
             "relative_path": relative_path,
             "main_media_relative_path": media_relative_path,
@@ -141,6 +171,12 @@ class MediaDataset(Dataset):
                 "fps": fps,
             },
         }
+        
+        # Add channel metadata if available and preservation is enabled
+        if channel_metadata is not None and self.preserve_all_channels:
+            result["channel_metadata"] = channel_metadata
+        
+        return result
 
     def _load_video_paths(self, column: str) -> list[Path]:
         """Load video paths from the specified data source."""
@@ -162,10 +198,10 @@ class MediaDataset(Dataset):
         data_root = self.dataset_file.parent
         video_paths = [data_root / Path(line.strip()) for line in df[column].tolist()]
 
-        # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
+        # Validate that all paths exist (can be files or directories for NPZ sequences)
+        invalid_paths = [path for path in video_paths if not (path.is_file() or path.is_dir())]
         if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
+            raise ValueError(f"Found {len(invalid_paths)} invalid paths. First few: {invalid_paths[:5]}")
 
         return video_paths
 
@@ -184,10 +220,10 @@ class MediaDataset(Dataset):
                 raise ValueError(f"Key '{column}' not found in JSON entry")
             video_paths.append(data_root / Path(entry[column].strip()))
 
-        # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
+        # Validate that all paths exist (can be files or directories for NPZ sequences)
+        invalid_paths = [path for path in video_paths if not (path.is_file() or path.is_dir())]
         if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
+            raise ValueError(f"Found {len(invalid_paths)} invalid paths. First few: {invalid_paths[:5]}")
 
         return video_paths
 
@@ -202,10 +238,10 @@ class MediaDataset(Dataset):
                     raise ValueError(f"Key '{column}' not found in JSONL entry")
                 video_paths.append(data_root / Path(entry[column].strip()))
 
-        # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
+        # Validate that all paths exist (can be files or directories for NPZ sequences)
+        invalid_paths = [path for path in video_paths if not (path.is_file() or path.is_dir())]
         if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
+            raise ValueError(f"Found {len(invalid_paths)} invalid paths. First few: {invalid_paths[:5]}")
 
         return video_paths
 
@@ -218,6 +254,50 @@ class MediaDataset(Dataset):
         for video_path in self.video_paths:
             if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 valid_video_paths.append(video_path)
+                continue
+            
+            if video_path.suffix.lower() == ".npz" or (video_path.is_dir() and list(video_path.glob("*.npz"))):
+                # Check NPZ file or NPZ sequence for sufficient frames
+                try:
+                    if video_path.is_dir():
+                        # NPZ sequence - count number of NPZ files
+                        npz_files = list(video_path.glob("*.npz"))
+                        num_frames = len(npz_files)
+                        if num_frames >= min_frames_required:
+                            valid_video_paths.append(video_path)
+                        else:
+                            logger.warning(
+                                f"Skipping NPZ sequence at {video_path} - has {num_frames} frames, "
+                                f"which is less than the minimum required frames ({min_frames_required})"
+                            )
+                    else:
+                        # Single NPZ file
+                        data = np.load(video_path)
+                        
+                        # Check if it has 'frames' or 'data' key (multi-frame format)
+                        if 'frames' in data or 'data' in data:
+                            frames_key = 'frames' if 'frames' in data else 'data'
+                            frames = data[frames_key]
+                            num_frames = frames.shape[0]
+                            
+                            if num_frames >= min_frames_required:
+                                valid_video_paths.append(video_path)
+                            else:
+                                logger.warning(
+                                    f"Skipping NPZ file at {video_path} - has {num_frames} frames, "
+                                    f"which is less than the minimum required frames ({min_frames_required})"
+                                )
+                        else:
+                            # Single frame with channels - treat as single frame
+                            if min_frames_required <= 1:
+                                valid_video_paths.append(video_path)
+                            else:
+                                logger.warning(
+                                    f"Skipping NPZ file at {video_path} - contains single frame with channels, "
+                                    f"but minimum required frames is {min_frames_required}"
+                                )
+                except Exception as e:
+                    logger.warning(f"Failed to read NPZ at {video_path}: {e!s}")
                 continue
 
             try:
@@ -281,6 +361,382 @@ class MediaDataset(Dataset):
         frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
 
         return frames, fps
+
+    def _preprocess_npz(self, path: Path) -> tuple[torch.Tensor, float, dict | None]:
+        """Preprocess an NPZ file containing physics simulation frames.
+        
+        Supports two formats:
+        1. Single NPZ with all frames: 'frames' key with shape (T, H, W, C) or (T, C, H, W)
+        2. Single NPZ with multiple channels: Multiple keys, each representing a channel
+        
+        Expected NPZ format:
+        - Format 1: 'frames' or 'data': numpy array of shape (T, H, W, C) or (T, C, H, W)
+        - Format 2: Multiple channel keys (e.g., 'temperature', 'pressure', 'velocity_x')
+                    Each channel should be a 2D array (H, W) for single frame
+        - 'fps': (optional) frames per second, defaults to 24
+        - 'channels': (optional) list of channel names to use, in order
+        
+        The frames array should contain normalized values in range [0, 1].
+        If values are in [0, 255], they will be automatically normalized.
+        
+        Args:
+            path: Path to the NPZ file
+            
+        Returns:
+            Tuple of (frames tensor, fps, channel_metadata)
+        """
+        # Load NPZ file
+        data = np.load(path)
+        
+        # Get FPS if available, otherwise default to 24
+        fps = float(data.get('fps', 24))
+        
+        # Initialize channel metadata
+        channel_metadata = None
+        channel_names_used = None
+        
+        # Check if this is Format 1 (frames key) or Format 2 (multiple channels)
+        if 'frames' in data or 'data' in data:
+            # Format 1: Single array with all frames
+            frames = data['frames'] if 'frames' in data else data['data']
+            frames = torch.from_numpy(frames).float()
+            
+            # Handle different input formats
+            # If frames are in format (T, H, W, C), convert to (T, C, H, W)
+            if frames.ndim == 4 and frames.shape[-1] in [1, 3, 4]:
+                frames = frames.permute(0, 3, 1, 2)
+            elif frames.ndim == 3:
+                # Grayscale (T, H, W) -> (T, 1, H, W)
+                frames = frames.unsqueeze(1)
+            elif frames.ndim != 4:
+                raise ValueError(
+                    f"Expected frames to have 3 or 4 dimensions, got {frames.ndim}. "
+                    f"Shape: {frames.shape}"
+                )
+        else:
+            # Format 2: Multiple channel keys (single frame)
+            # Get channel names from 'channels' key or use first 3 available keys
+            available_keys = [k for k in data.keys() if k not in ['fps', 'channels']]
+            
+            if 'channels' in data:
+                # Use specified channels
+                channel_names = data['channels']
+                if isinstance(channel_names, np.ndarray):
+                    channel_names = channel_names.tolist()
+                    if isinstance(channel_names[0], bytes):
+                        channel_names = [c.decode('utf-8') for c in channel_names]
+            else:
+                # Use first available channels (up to 3 for RGB)
+                channel_names = available_keys[:3]
+            
+            if not channel_names:
+                raise ValueError(
+                    f"No valid channel data found in NPZ file. "
+                    f"Available keys: {list(data.keys())}"
+                )
+            
+            # Store channel names for metadata
+            channel_names_used = channel_names
+            
+            # Load and stack channels
+            channel_data = []
+            for channel_name in channel_names:
+                if channel_name not in data:
+                    raise ValueError(
+                        f"Channel '{channel_name}' not found in NPZ file. "
+                        f"Available keys: {list(data.keys())}"
+                    )
+                channel = data[channel_name]
+                
+                # Ensure channel is 2D (H, W)
+                if channel.ndim == 2:
+                    channel_data.append(torch.from_numpy(channel).float())
+                else:
+                    raise ValueError(
+                        f"Expected channel '{channel_name}' to be 2D (H, W), "
+                        f"got shape {channel.shape}"
+                    )
+            
+            # Stack channels: (C, H, W)
+            frames = torch.stack(channel_data, dim=0)
+            # Add time dimension: (1, C, H, W)
+            frames = frames.unsqueeze(0)
+            
+            # Create channel metadata
+            if self.preserve_all_channels:
+                channel_metadata = {
+                    'channel_names': channel_names_used,
+                    'all_available_channels': available_keys,
+                    'source_path': str(path),
+                }
+        
+        # Normalize to [0, 1] if values are in [0, 255] or larger
+        if frames.max() > 1.0:
+            if frames.max() <= 255.0:
+                frames = frames / 255.0
+            else:
+                # Normalize to [0, 1] based on actual range
+                min_val = frames.min()
+                max_val = frames.max()
+                frames = (frames - min_val) / (max_val - min_val + 1e-8)
+        
+        # Handle channel count
+        num_channels = frames.shape[1]
+        
+        # Multi-channel mode: preserve all channels
+        if self.use_multi_channel:
+            target_channels = self.num_channels
+            
+            if num_channels < target_channels:
+                # Pad with zeros or repeat last channel
+                logger.warning(
+                    f"NPZ has {num_channels} channels but {target_channels} expected. "
+                    f"Padding with zeros."
+                )
+                padding = torch.zeros(
+                    (frames.shape[0], target_channels - num_channels, frames.shape[2], frames.shape[3]),
+                    dtype=frames.dtype,
+                    device=frames.device
+                )
+                frames = torch.cat([frames, padding], dim=1)
+            elif num_channels > target_channels:
+                # Take only the requested channels
+                logger.warning(
+                    f"NPZ has {num_channels} channels but only {target_channels} requested. "
+                    f"Taking first {target_channels} channels."
+                )
+                frames = frames[:, :target_channels, :, :]
+            
+            # channels now match target_channels
+        else:
+            # Original 3-channel logic
+            if num_channels == 4:
+                # Drop alpha channel, keep RGB
+                frames = frames[:, :3, :, :]
+            elif num_channels == 1:
+                # Grayscale - expand to 3 channels
+                frames = frames.repeat(1, 3, 1, 1)
+            elif num_channels == 2:
+                # Two channels - add a zero channel to make RGB
+                zero_channel = torch.zeros_like(frames[:, :1, :, :])
+                frames = torch.cat([frames, zero_channel], dim=1)
+            elif num_channels > 4:
+                # More than 4 channels - take first 3
+                logger.warning(
+                    f"NPZ file has {num_channels} channels. Using only the first 3 for RGB representation."
+                )
+                frames = frames[:, :3, :, :]
+            elif num_channels != 3:
+                raise ValueError(
+                    f"Unexpected number of channels: {num_channels}. "
+                    f"Expected 1, 2, 3, or 4 channels."
+                )
+        
+        video_num_frames = frames.shape[0]
+        
+        # Select appropriate frame bucket
+        relevant_buckets = [bucket for bucket in self.resolution_buckets if bucket[0] <= video_num_frames]
+        nearest_frame_bucket = min(
+            relevant_buckets,
+            key=lambda x: abs(x[0] - min(video_num_frames, self.max_num_frames)),
+            default=[1],
+        )[0]
+        
+        # Take only the required number of frames
+        frames = frames[:nearest_frame_bucket]
+        
+        # Resize and crop to target resolution
+        nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+        frames_resized = self._resize_and_crop(frames, nearest_res)
+        
+        # Apply transforms
+        frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
+        
+        return frames, fps, channel_metadata
+
+    def _preprocess_npz_sequence(self, path: Path) -> tuple[torch.Tensor, float, dict | None]:
+        """Preprocess a sequence of NPZ files (one per frame).
+        
+        Each NPZ file should contain:
+        - Multiple channel keys (e.g., 'temperature', 'pressure', 'velocity_x')
+        - Each channel is a 2D array (H, W)
+        - Optional 'channels' key specifying which channels to use and in what order
+        - Optional 'fps' key (only read from first file)
+        
+        Args:
+            path: Path to directory containing NPZ files
+            
+        Returns:
+            Tuple of (frames tensor, fps, channel_metadata)
+        """
+        # Get all NPZ files in directory, sorted by name
+        npz_files = sorted(path.glob("*.npz"))
+        
+        if not npz_files:
+            raise ValueError(f"No NPZ files found in directory: {path}")
+        
+        # Validate initial frame index
+        if self.initial_frame_index >= len(npz_files):
+            logger.warning(
+                f"Initial frame index {self.initial_frame_index} >= number of files {len(npz_files)}. "
+                f"Using index 0 instead."
+            )
+            start_frame_idx = 0
+        else:
+            start_frame_idx = self.initial_frame_index
+        
+        # Load initial frame file to get FPS and channel configuration
+        initial_frame_data = np.load(npz_files[start_frame_idx])
+        fps = float(initial_frame_data.get('fps', 24))
+        
+        # Get channel names
+        available_keys = [k for k in initial_frame_data.keys() if k not in ['fps', 'channels']]
+        
+        if 'channels' in initial_frame_data:
+            channel_names = initial_frame_data['channels']
+            if isinstance(channel_names, np.ndarray):
+                channel_names = channel_names.tolist()
+                if isinstance(channel_names[0], bytes):
+                    channel_names = [c.decode('utf-8') for c in channel_names]
+        else:
+            # Use first 3 available channels for RGB
+            channel_names = available_keys[:3]
+        
+        if not channel_names:
+            raise ValueError(
+                f"No valid channel data found in NPZ files. "
+                f"Available keys in initial frame: {list(initial_frame_data.keys())}"
+            )
+        
+        # Create channel metadata
+        channel_metadata = None
+        if self.preserve_all_channels:
+            channel_metadata = {
+                'channel_names': channel_names,
+                'all_available_channels': available_keys,
+                'initial_frame_index': start_frame_idx,
+                'num_files': len(npz_files),
+                'source_path': str(path),
+            }
+        
+        logger.info(
+            f"Loading NPZ sequence from {path.name}: "
+            f"{len(npz_files)} files, starting from frame {start_frame_idx}, "
+            f"using channels: {channel_names}"
+        )
+        
+        # Determine how many frames to load based on resolution buckets
+        max_frames_needed = max(bucket[0] for bucket in self.resolution_buckets)
+        frames_available = len(npz_files) - start_frame_idx
+        frames_to_load = min(frames_available, max_frames_needed)
+        
+        # Load frames starting from initial frame
+        all_frames = []
+        for i in range(start_frame_idx, start_frame_idx + frames_to_load):
+            if i >= len(npz_files):
+                break
+            
+            frame_data = np.load(npz_files[i])
+            
+            # Load and stack channels for this frame
+            channel_data = []
+            for channel_name in channel_names:
+                if channel_name not in frame_data:
+                    raise ValueError(
+                        f"Channel '{channel_name}' not found in {npz_files[i].name}. "
+                        f"Available keys: {list(frame_data.keys())}"
+                    )
+                channel = frame_data[channel_name]
+                
+                if channel.ndim != 2:
+                    raise ValueError(
+                        f"Expected channel '{channel_name}' in {npz_files[i].name} to be 2D (H, W), "
+                        f"got shape {channel.shape}"
+                    )
+                
+                channel_data.append(torch.from_numpy(channel).float())
+            
+            # Stack channels: (C, H, W)
+            frame = torch.stack(channel_data, dim=0)
+            all_frames.append(frame)
+        
+        # Stack all frames: (T, C, H, W)
+        frames = torch.stack(all_frames, dim=0)
+        
+        # Normalize to [0, 1] if values are in [0, 255] or larger
+        if frames.max() > 1.0:
+            if frames.max() <= 255.0:
+                frames = frames / 255.0
+            else:
+                # Normalize to [0, 1] based on actual range
+                min_val = frames.min()
+                max_val = frames.max()
+                frames = (frames - min_val) / (max_val - min_val + 1e-8)
+        
+        # Handle channel count
+        num_channels = frames.shape[1]
+        
+        # Multi-channel mode: preserve all channels
+        if self.use_multi_channel:
+            target_channels = self.num_channels
+            
+            if num_channels < target_channels:
+                # Pad with zeros
+                logger.warning(
+                    f"NPZ sequence has {num_channels} channels but {target_channels} expected. "
+                    f"Padding with zeros."
+                )
+                padding = torch.zeros(
+                    (frames.shape[0], target_channels - num_channels, frames.shape[2], frames.shape[3]),
+                    dtype=frames.dtype,
+                    device=frames.device
+                )
+                frames = torch.cat([frames, padding], dim=1)
+            elif num_channels > target_channels:
+                # Take only the requested channels
+                logger.warning(
+                    f"NPZ sequence has {num_channels} channels but only {target_channels} requested. "
+                    f"Taking first {target_channels} channels."
+                )
+                frames = frames[:, :target_channels, :, :]
+        else:
+            # Original 3-channel logic
+            if num_channels == 4:
+                frames = frames[:, :3, :, :]
+            elif num_channels == 1:
+                frames = frames.repeat(1, 3, 1, 1)
+            elif num_channels == 2:
+                zero_channel = torch.zeros_like(frames[:, :1, :, :])
+                frames = torch.cat([frames, zero_channel], dim=1)
+            elif num_channels > 4:
+                logger.warning(
+                    f"NPZ sequence has {num_channels} channels. Using only the first 3 for RGB representation."
+                )
+                frames = frames[:, :3, :, :]
+            elif num_channels != 3:
+                raise ValueError(f"Unexpected number of channels: {num_channels}")
+        
+        video_num_frames = frames.shape[0]
+        
+        # Select appropriate frame bucket
+        relevant_buckets = [bucket for bucket in self.resolution_buckets if bucket[0] <= video_num_frames]
+        nearest_frame_bucket = min(
+            relevant_buckets,
+            key=lambda x: abs(x[0] - min(video_num_frames, self.max_num_frames)),
+            default=[1],
+        )[0]
+        
+        # Take only the required number of frames
+        frames = frames[:nearest_frame_bucket]
+        
+        # Resize and crop to target resolution
+        nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+        frames_resized = self._resize_and_crop(frames, nearest_res)
+        
+        # Apply transforms
+        frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
+        
+        return frames, fps, channel_metadata
 
     def _find_nearest_resolution(self, height: int, width: int) -> tuple[int, int]:
         """Find the nearest resolution bucket for the given dimensions."""
