@@ -60,7 +60,8 @@ All detailed guides and technical documentation have been moved to the `docs/` d
 - [🎬 Dataset Preparation](docs/dataset-preparation.md)
 - [🛠️ Training Modes](docs/training-modes.md)
 - [🔬 NPZ Physics Simulations](docs/npz-physics-simulations.md) - Train on physics simulation data
-- [🚀 Enhanced NPZ Features](docs/enhanced-npz-features.md) - **NEW!** Advanced features for physics simulations
+- [🚀 Enhanced NPZ Features](docs/enhanced-npz-features.md) - Advanced features for physics simulations
+- [🌈 Multi-Channel Support](docs/multi-channel-support.md) - **NEW!** True N-channel input/output
 - [⚙️ Configuration Reference](docs/configuration-reference.md)
 - [🚀 Training Guide](docs/training-guide.md)
 - [🔧 Utility Scripts](docs/utility-scripts.md)
