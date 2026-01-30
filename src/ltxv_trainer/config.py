@@ -204,6 +204,23 @@ class DataConfig(ConfigBaseModel):
         default=False,
         description="If True, preserve all channel data for post-processing (stored as metadata)",
     )
+    
+    # NEW: Multi-channel support
+    use_multi_channel_vae: bool = Field(
+        default=False,
+        description="Enable multi-channel VAE wrapper to process all channels (not just RGB)",
+    )
+    
+    num_channels: int = Field(
+        default=3,
+        description="Total number of channels to process (3 for RGB, >3 for multi-channel)",
+        ge=1,
+    )
+    
+    channel_grouping_strategy: str = Field(
+        default="sequential",
+        description="Strategy for grouping channels in multi-channel mode ('sequential' or 'interleaved')",
+    )
 
 
 class ValidationConfig(ConfigBaseModel):

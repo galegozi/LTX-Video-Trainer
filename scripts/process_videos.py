@@ -74,6 +74,8 @@ class MediaDataset(Dataset):
         reshape_mode: str = "center",
         initial_frame_index: int = 0,
         preserve_all_channels: bool = False,
+        use_multi_channel: bool = False,
+        num_channels: int = 3,
     ) -> None:
         """
         Initialize the media dataset.
@@ -85,6 +87,8 @@ class MediaDataset(Dataset):
             reshape_mode: How to crop videos ("center", "random")
             initial_frame_index: Which frame to use as initial condition for sequences
             preserve_all_channels: If True, save all channel metadata for NPZ files
+            use_multi_channel: If True, preserve all channels for multi-channel VAE
+            num_channels: Number of channels to preserve (only used if use_multi_channel=True)
         """
         super().__init__()
 
@@ -94,6 +98,8 @@ class MediaDataset(Dataset):
         self.reshape_mode = reshape_mode
         self.initial_frame_index = initial_frame_index
         self.preserve_all_channels = preserve_all_channels
+        self.use_multi_channel = use_multi_channel
+        self.num_channels = num_channels
 
         # First load main media paths
         self.main_media_paths = self._load_video_paths(main_media_column)
@@ -106,13 +112,21 @@ class MediaDataset(Dataset):
 
         self.max_num_frames = max(self.resolution_buckets, key=lambda x: x[0])[0]
 
-        # Set up video transforms
-        self.transforms = transforms.Compose(
-            [
+        # Set up video transforms - need to handle different channel counts
+        if use_multi_channel and num_channels != 3:
+            # For multi-channel, don't normalize - will handle per-channel later
+            self.transforms = transforms.Compose([
                 transforms.Lambda(lambda x: x.clamp_(0, 1)),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
-            ]
-        )
+                # Note: Normalization will be handled separately for multi-channel
+            ])
+        else:
+            # Standard 3-channel normalization
+            self.transforms = transforms.Compose(
+                [
+                    transforms.Lambda(lambda x: x.clamp_(0, 1)),
+                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+                ]
+            )
 
     def __len__(self) -> int:
         return len(self.video_paths)
@@ -469,27 +483,54 @@ class MediaDataset(Dataset):
         # Handle channel count
         num_channels = frames.shape[1]
         
-        if num_channels == 4:
-            # Drop alpha channel, keep RGB
-            frames = frames[:, :3, :, :]
-        elif num_channels == 1:
-            # Grayscale - expand to 3 channels
-            frames = frames.repeat(1, 3, 1, 1)
-        elif num_channels == 2:
-            # Two channels - add a zero channel to make RGB
-            zero_channel = torch.zeros_like(frames[:, :1, :, :])
-            frames = torch.cat([frames, zero_channel], dim=1)
-        elif num_channels > 4:
-            # More than 4 channels - take first 3
-            logger.warning(
-                f"NPZ file has {num_channels} channels. Using only the first 3 for RGB representation."
-            )
-            frames = frames[:, :3, :, :]
-        elif num_channels != 3:
-            raise ValueError(
-                f"Unexpected number of channels: {num_channels}. "
-                f"Expected 1, 2, 3, or 4 channels."
-            )
+        # Multi-channel mode: preserve all channels
+        if self.use_multi_channel:
+            target_channels = self.num_channels
+            
+            if num_channels < target_channels:
+                # Pad with zeros or repeat last channel
+                logger.warning(
+                    f"NPZ has {num_channels} channels but {target_channels} expected. "
+                    f"Padding with zeros."
+                )
+                padding = torch.zeros(
+                    (frames.shape[0], target_channels - num_channels, frames.shape[2], frames.shape[3]),
+                    dtype=frames.dtype,
+                    device=frames.device
+                )
+                frames = torch.cat([frames, padding], dim=1)
+            elif num_channels > target_channels:
+                # Take only the requested channels
+                logger.warning(
+                    f"NPZ has {num_channels} channels but only {target_channels} requested. "
+                    f"Taking first {target_channels} channels."
+                )
+                frames = frames[:, :target_channels, :, :]
+            
+            # channels now match target_channels
+        else:
+            # Original 3-channel logic
+            if num_channels == 4:
+                # Drop alpha channel, keep RGB
+                frames = frames[:, :3, :, :]
+            elif num_channels == 1:
+                # Grayscale - expand to 3 channels
+                frames = frames.repeat(1, 3, 1, 1)
+            elif num_channels == 2:
+                # Two channels - add a zero channel to make RGB
+                zero_channel = torch.zeros_like(frames[:, :1, :, :])
+                frames = torch.cat([frames, zero_channel], dim=1)
+            elif num_channels > 4:
+                # More than 4 channels - take first 3
+                logger.warning(
+                    f"NPZ file has {num_channels} channels. Using only the first 3 for RGB representation."
+                )
+                frames = frames[:, :3, :, :]
+            elif num_channels != 3:
+                raise ValueError(
+                    f"Unexpected number of channels: {num_channels}. "
+                    f"Expected 1, 2, 3, or 4 channels."
+                )
         
         video_num_frames = frames.shape[0]
         
@@ -635,20 +676,45 @@ class MediaDataset(Dataset):
         # Handle channel count
         num_channels = frames.shape[1]
         
-        if num_channels == 4:
-            frames = frames[:, :3, :, :]
-        elif num_channels == 1:
-            frames = frames.repeat(1, 3, 1, 1)
-        elif num_channels == 2:
-            zero_channel = torch.zeros_like(frames[:, :1, :, :])
-            frames = torch.cat([frames, zero_channel], dim=1)
-        elif num_channels > 4:
-            logger.warning(
-                f"NPZ sequence has {num_channels} channels. Using only the first 3 for RGB representation."
-            )
-            frames = frames[:, :3, :, :]
-        elif num_channels != 3:
-            raise ValueError(f"Unexpected number of channels: {num_channels}")
+        # Multi-channel mode: preserve all channels
+        if self.use_multi_channel:
+            target_channels = self.num_channels
+            
+            if num_channels < target_channels:
+                # Pad with zeros
+                logger.warning(
+                    f"NPZ sequence has {num_channels} channels but {target_channels} expected. "
+                    f"Padding with zeros."
+                )
+                padding = torch.zeros(
+                    (frames.shape[0], target_channels - num_channels, frames.shape[2], frames.shape[3]),
+                    dtype=frames.dtype,
+                    device=frames.device
+                )
+                frames = torch.cat([frames, padding], dim=1)
+            elif num_channels > target_channels:
+                # Take only the requested channels
+                logger.warning(
+                    f"NPZ sequence has {num_channels} channels but only {target_channels} requested. "
+                    f"Taking first {target_channels} channels."
+                )
+                frames = frames[:, :target_channels, :, :]
+        else:
+            # Original 3-channel logic
+            if num_channels == 4:
+                frames = frames[:, :3, :, :]
+            elif num_channels == 1:
+                frames = frames.repeat(1, 3, 1, 1)
+            elif num_channels == 2:
+                zero_channel = torch.zeros_like(frames[:, :1, :, :])
+                frames = torch.cat([frames, zero_channel], dim=1)
+            elif num_channels > 4:
+                logger.warning(
+                    f"NPZ sequence has {num_channels} channels. Using only the first 3 for RGB representation."
+                )
+                frames = frames[:, :3, :, :]
+            elif num_channels != 3:
+                raise ValueError(f"Unexpected number of channels: {num_channels}")
         
         video_num_frames = frames.shape[0]
         
