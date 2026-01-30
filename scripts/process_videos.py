@@ -163,12 +163,6 @@ class MediaDataset(Dataset):
             result["channel_metadata"] = channel_metadata
         
         return result
-                "num_frames": video.shape[0],
-                "height": video.shape[2],
-                "width": video.shape[3],
-                "fps": fps,
-            },
-        }
 
     def _load_video_paths(self, column: str) -> list[Path]:
         """Load video paths from the specified data source."""
