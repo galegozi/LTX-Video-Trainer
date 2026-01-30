@@ -127,6 +127,8 @@ class MediaDataset(Dataset):
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             video = self._preprocess_image(video_path)
             fps = 1
+        elif video_path.suffix.lower() == ".npz":
+            video, fps = self._preprocess_npz(video_path)
         else:
             video, fps = self._preprocess_video(video_path)
 
@@ -219,6 +221,30 @@ class MediaDataset(Dataset):
             if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 valid_video_paths.append(video_path)
                 continue
+            
+            if video_path.suffix.lower() == ".npz":
+                # Check NPZ file for sufficient frames
+                try:
+                    data = np.load(video_path)
+                    # Support both 'frames' and 'data' keys
+                    frames_key = 'frames' if 'frames' in data else 'data' if 'data' in data else None
+                    if frames_key is None:
+                        logger.warning(f"Skipping NPZ file at {video_path} - no 'frames' or 'data' key found")
+                        continue
+                    
+                    frames = data[frames_key]
+                    num_frames = frames.shape[0]
+                    
+                    if num_frames >= min_frames_required:
+                        valid_video_paths.append(video_path)
+                    else:
+                        logger.warning(
+                            f"Skipping NPZ file at {video_path} - has {num_frames} frames, "
+                            f"which is less than the minimum required frames ({min_frames_required})"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to read NPZ file at {video_path}: {e!s}")
+                continue
 
             try:
                 video_reader = decord.VideoReader(uri=video_path.as_posix())
@@ -280,6 +306,92 @@ class MediaDataset(Dataset):
         frames_resized = self._resize_and_crop(frames, nearest_res)
         frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
 
+        return frames, fps
+
+    def _preprocess_npz(self, path: Path) -> tuple[torch.Tensor, float]:
+        """Preprocess an NPZ file containing physics simulation frames.
+        
+        Expected NPZ format:
+        - 'frames': numpy array of shape (T, H, W, C) or (T, C, H, W)
+        - 'fps': (optional) frames per second, defaults to 24
+        
+        The frames array should contain normalized values in range [0, 1].
+        If values are in [0, 255], they will be automatically normalized.
+        
+        Args:
+            path: Path to the NPZ file
+            
+        Returns:
+            Tuple of (frames tensor, fps)
+        """
+        # Load NPZ file
+        data = np.load(path)
+        
+        # Get frames from NPZ - support both 'frames' and 'data' keys
+        if 'frames' in data:
+            frames = data['frames']
+        elif 'data' in data:
+            frames = data['data']
+        else:
+            raise ValueError(
+                f"NPZ file must contain 'frames' or 'data' key. "
+                f"Found keys: {list(data.keys())}"
+            )
+        
+        # Get FPS if available, otherwise default to 24
+        fps = float(data.get('fps', 24))
+        
+        # Convert to torch tensor
+        frames = torch.from_numpy(frames).float()
+        
+        # Handle different input formats
+        # If frames are in format (T, H, W, C), convert to (T, C, H, W)
+        if frames.ndim == 4 and frames.shape[-1] in [1, 3, 4]:
+            frames = frames.permute(0, 3, 1, 2)
+        elif frames.ndim == 3:
+            # Grayscale (T, H, W) -> (T, 1, H, W)
+            frames = frames.unsqueeze(1)
+        elif frames.ndim != 4:
+            raise ValueError(
+                f"Expected frames to have 3 or 4 dimensions, got {frames.ndim}. "
+                f"Shape: {frames.shape}"
+            )
+        
+        # Normalize to [0, 1] if values are in [0, 255]
+        if frames.max() > 1.0:
+            frames = frames / 255.0
+        
+        # If frames have alpha channel, drop it and keep only RGB
+        if frames.shape[1] == 4:
+            frames = frames[:, :3, :, :]
+        elif frames.shape[1] == 1:
+            # If grayscale, expand to 3 channels
+            frames = frames.repeat(1, 3, 1, 1)
+        elif frames.shape[1] != 3:
+            raise ValueError(
+                f"Expected 1, 3, or 4 channels, got {frames.shape[1]} channels"
+            )
+        
+        video_num_frames = frames.shape[0]
+        
+        # Select appropriate frame bucket
+        relevant_buckets = [bucket for bucket in self.resolution_buckets if bucket[0] <= video_num_frames]
+        nearest_frame_bucket = min(
+            relevant_buckets,
+            key=lambda x: abs(x[0] - min(video_num_frames, self.max_num_frames)),
+            default=[1],
+        )[0]
+        
+        # Take only the required number of frames
+        frames = frames[:nearest_frame_bucket]
+        
+        # Resize and crop to target resolution
+        nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+        frames_resized = self._resize_and_crop(frames, nearest_res)
+        
+        # Apply transforms
+        frames = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
+        
         return frames, fps
 
     def _find_nearest_resolution(self, height: int, width: int) -> tuple[int, int]:
